@@ -113,7 +113,7 @@ browser_session = BrowserSession()
 
 agent = Agent(
 	task=task,
-	llm=ChatOpenAI(model='gpt-4o'),
+	llm=ChatOpenAI(model='gpt-4.1'),
 	browser_session=browser_session,
 )
 
@@ -121,7 +121,7 @@ agent = Agent(
 async def main():
 	await agent.run()
 	input('Press Enter to close the browser...')
-	await browser_session.close()
+	await browser_session.kill()
 
 
 if __name__ == '__main__':

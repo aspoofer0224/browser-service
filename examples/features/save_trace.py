@@ -12,7 +12,7 @@ from browser_use.agent.service import Agent
 from browser_use.browser import BrowserProfile, BrowserSession
 from browser_use.llm import ChatOpenAI
 
-llm = ChatOpenAI(model='gpt-4o', temperature=0.0)
+llm = ChatOpenAI(model='gpt-4.1', temperature=0.0)
 
 
 async def main():
@@ -23,13 +23,16 @@ async def main():
 		)
 	)
 
-	async with browser_session:
+	await browser_session.start()
+	try:
 		agent = Agent(
 			task='Go to hackernews, then go to apple.com and return all titles of open tabs',
 			llm=llm,
 			browser_session=browser_session,
 		)
 		await agent.run()
+	finally:
+		await browser_session.stop()
 
 
 asyncio.run(main())

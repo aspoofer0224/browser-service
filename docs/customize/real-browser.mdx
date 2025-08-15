@@ -321,7 +321,7 @@ playwright = await async_playwright().start()
 browser = await playwright.chromium.launch(headless=True)
 context = await browser.new_context()
 shared_page = await context.new_page()
-await shared_page.goto('https://example.com', wait_until='domcontentloaded')
+await shared_page.goto('https://example.com', wait_until='load')
 
 shared_session = BrowserSession(page=shared_page, keep_alive=True)
 await shared_session.start()
@@ -365,11 +365,11 @@ shared_profile = BrowserProfile(
     keep_alive=True,                  # don't close the browser after the agent finishes
 )
 
-window1 = BrowserSession(browser_profile=profile_a)
+window1 = BrowserSession(browser_profile=shared_profile)
 await window1.start()
 agent1 = Agent(browser_session=window1)
 
-window2 = BrowserSession(browser_profile=profile_a)
+window2 = BrowserSession(browser_profile=shared_profile)
 await window2.start()
 agent2 = Agent(browser_session=window2)
 

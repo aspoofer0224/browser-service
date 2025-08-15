@@ -79,7 +79,7 @@ class TestCoreFunctionality:
 	def llm(self):
 		"""Initialize language model for testing with minimal settings."""
 		return ChatOpenAI(
-			model='gpt-4o',
+			model='gpt-4.1',
 			temperature=0.0,
 		)
 
@@ -279,6 +279,6 @@ class TestCoreFunctionality:
 		assert final_scroll_position > initial_scroll_position, 'Page did not scroll down'
 
 		# Verify the action was executed
-		history = agent.state.history
+		history = agent.history
 		action_names = history.action_names()
 		assert 'scroll_down' in action_names

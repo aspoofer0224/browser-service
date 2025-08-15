@@ -11,7 +11,6 @@ from typing import Any, Generic, Optional, TypeVar, Union, get_args, get_origin
 from pydantic import BaseModel, Field, RootModel, create_model
 
 from browser_use.browser import BrowserSession
-from browser_use.browser.types import Page
 from browser_use.controller.registry.views import (
 	ActionModel,
 	ActionRegistry,
@@ -20,8 +19,9 @@ from browser_use.controller.registry.views import (
 )
 from browser_use.filesystem.file_system import FileSystem
 from browser_use.llm.base import BaseChatModel
+from browser_use.observability import observe_debug
 from browser_use.telemetry.service import ProductTelemetry
-from browser_use.utils import match_url_with_domain_pattern, time_execution_async
+from browser_use.utils import is_new_tab_page, match_url_with_domain_pattern, time_execution_async
 
 Context = TypeVar('Context')
 
@@ -41,13 +41,12 @@ class Registry(Generic[Context]):
 		# Manually define the expected types to avoid issues with Optional handling.
 		# we should try to reduce this list to 0 if possible, give as few standardized objects to all the actions
 		# but each driver should decide what is relevant to expose the action methods,
-		# e.g. playwright page, 2fa code getters, sensitive_data wrappers, other context, etc.
+		# e.g. CDP client, 2fa code getters, sensitive_data wrappers, other context, etc.
 		return {
 			'context': None,  # Context is a TypeVar, so we can't validate type
 			'browser_session': BrowserSession,
-			'browser': BrowserSession,  # legacy name
-			'browser_context': BrowserSession,  # legacy name
-			'page': Page,
+			'page_url': str,
+			'cdp_client': None,  # CDPClient type from cdp_use, but we don't import it here
 			'page_extraction_llm': BaseChatModel,
 			'available_file_paths': list,
 			'has_sensitive_data': bool,
@@ -276,7 +275,6 @@ class Registry(Generic[Context]):
 		param_model: type[BaseModel] | None = None,
 		domains: list[str] | None = None,
 		allowed_domains: list[str] | None = None,
-		page_filter: Callable[[Any], bool] | None = None,
 	):
 		"""Decorator for registering actions"""
 		# Handle aliases: domains and allowed_domains are the same parameter
@@ -299,7 +297,6 @@ class Registry(Generic[Context]):
 				function=normalized_func,
 				param_model=actual_param_model,
 				domains=final_domains,
-				page_filter=page_filter,
 			)
 			self.registry.actions[func.__name__] = action
 
@@ -308,6 +305,7 @@ class Registry(Generic[Context]):
 
 		return decorator
 
+	@observe_debug(ignore_input=True, ignore_output=True, name='execute_action')
 	@time_execution_async('--execute_action')
 	async def execute_action(
 		self,
@@ -336,32 +334,38 @@ class Registry(Generic[Context]):
 			if sensitive_data:
 				# Get current URL if browser_session is provided
 				current_url = None
-				if browser_session:
-					if browser_session.agent_current_page:
-						current_url = browser_session.agent_current_page.url
-					else:
-						current_page = await browser_session.get_current_page()
-						current_url = current_page.url if current_page else None
+				if browser_session and browser_session.current_target_id:
+					try:
+						# Get current page info using CDP
+						targets = await browser_session.cdp_client.send.Target.getTargets()
+						for target in targets.get('targetInfos', []):
+							if target.get('targetId') == browser_session.current_target_id:
+								current_url = target.get('url')
+								break
+					except Exception:
+						pass
 				validated_params = self._replace_sensitive_data(validated_params, sensitive_data, current_url)
 
 			# Build special context dict
 			special_context = {
 				'context': context,
 				'browser_session': browser_session,
-				'browser': browser_session,  # legacy support
-				'browser_context': browser_session,  # legacy support
 				'page_extraction_llm': page_extraction_llm,
 				'available_file_paths': available_file_paths,
 				'has_sensitive_data': action_name == 'input_text' and bool(sensitive_data),
 				'file_system': file_system,
 			}
 
-			# Handle async page parameter if needed
+			# Add CDP-related parameters if browser_session is available
 			if browser_session:
-				# Check if function signature includes 'page' parameter
-				sig = signature(action.function)
-				if 'page' in sig.parameters:
-					special_context['page'] = await browser_session.get_current_page()
+				# Add page_url
+				try:
+					special_context['page_url'] = await browser_session.get_current_page_url()
+				except Exception:
+					special_context['page_url'] = None
+
+				# Add cdp_client
+				special_context['cdp_client'] = browser_session.cdp_client
 
 			# All functions are now normalized to accept kwargs only
 			# Call with params and unpacked special context
@@ -369,14 +373,14 @@ class Registry(Generic[Context]):
 				return await action.function(params=validated_params, **special_context)
 			except Exception as e:
 				# Retry once if it's a page error
-				logger.warning(f'⚠️ Action {action_name}() failed: {type(e).__name__}: {e}, trying one more time...')
-				special_context['page'] = browser_session and await browser_session.get_current_page()
-				try:
-					return await action.function(params=validated_params, **special_context)
-				except Exception as retry_error:
-					raise RuntimeError(
-						f'Action {action_name}() failed: {type(e).__name__}: {e} (page may have closed or navigated away mid-action)'
-					) from retry_error
+				# logger.warning(f'⚠️ Action {action_name}() failed: {type(e).__name__}: {e}, trying one more time...')
+				# special_context['page'] = browser_session and await browser_session.get_current_page()
+				# try:
+				# 	return await action.function(params=validated_params, **special_context)
+				# except Exception as retry_error:
+				# 	raise RuntimeError(
+				# 		f'Action {action_name}() failed: {type(e).__name__}: {e} (page may have closed or navigated away mid-action)'
+				# 	) from retry_error
 				raise
 
 		except ValueError as e:
@@ -393,7 +397,7 @@ class Registry(Generic[Context]):
 	def _log_sensitive_data_usage(self, placeholders_used: set[str], current_url: str | None) -> None:
 		"""Log when sensitive data is being used on a page"""
 		if placeholders_used:
-			url_info = f' on {current_url}' if current_url and current_url != 'about:blank' else ''
+			url_info = f' on {current_url}' if current_url and not is_new_tab_page(current_url) else ''
 			logger.info(f'🔒 Using sensitive data placeholders: {", ".join(sorted(placeholders_used))}{url_info}')
 
 	def _replace_sensitive_data(
@@ -425,7 +429,7 @@ class Registry(Generic[Context]):
 			if isinstance(content, dict):
 				# New format: {domain_pattern: {key: value}}
 				# Only include secrets for domains that match the current URL
-				if current_url and current_url != 'about:blank':
+				if current_url and not is_new_tab_page(current_url):
 					# it's a real url, check it using our custom allowed_domains scheme://*.example.com glob matching
 					if match_url_with_domain_pattern(current_url, domain_or_key):
 						applicable_secrets.update(content)
@@ -469,7 +473,7 @@ class Registry(Generic[Context]):
 		return type(params).model_validate(processed_params)
 
 	# @time_execution_sync('--create_action_model')
-	def create_action_model(self, include_actions: list[str] | None = None, page=None) -> type[ActionModel]:
+	def create_action_model(self, include_actions: list[str] | None = None, page_url: str | None = None) -> type[ActionModel]:
 		"""Creates a Union of individual action models from registered actions,
 		used by LLM APIs that support tool calling & enforce a schema.
 
@@ -478,27 +482,26 @@ class Registry(Generic[Context]):
 		"""
 		from typing import Union
 
-		# Filter actions based on page if provided:
-		#   if page is None, only include actions with no filters
-		#   if page is provided, only include actions that match the page
+		# Filter actions based on page_url if provided:
+		#   if page_url is None, only include actions with no filters
+		#   if page_url is provided, only include actions that match the URL
 
 		available_actions: dict[str, RegisteredAction] = {}
 		for name, action in self.registry.actions.items():
 			if include_actions is not None and name not in include_actions:
 				continue
 
-			# If no page provided, only include actions with no filters
-			if page is None:
-				if action.page_filter is None and action.domains is None:
+			# If no page_url provided, only include actions with no filters
+			if page_url is None:
+				if action.domains is None:
 					available_actions[name] = action
 				continue
 
-			# Check page_filter if present
-			domain_is_allowed = self.registry._match_domains(action.domains, page.url)
-			page_is_allowed = self.registry._match_page_filter(action.page_filter, page)
+			# Check domain filter if present
+			domain_is_allowed = self.registry._match_domains(action.domains, page_url)
 
-			# Include action if both filters match (or if either is not present)
-			if domain_is_allowed and page_is_allowed:
+			# Include action if domain filter matches
+			if domain_is_allowed:
 				available_actions[name] = action
 
 		# Create individual action models for each action
@@ -560,10 +563,10 @@ class Registry(Generic[Context]):
 
 		return result_model  # type:ignore
 
-	def get_prompt_description(self, page=None) -> str:
+	def get_prompt_description(self, page_url: str | None = None) -> str:
 		"""Get a description of all actions for the prompt
 
-		If page is provided, only include actions that are available for that page
-		based on their filter_func
+		If page_url is provided, only include actions that are available for that URL
+		based on their domain filters
 		"""
-		return self.registry.get_prompt_description(page=page)
+		return self.registry.get_prompt_description(page_url=page_url)

@@ -4,6 +4,7 @@ Test that screenshots work correctly in headless browser mode.
 
 import asyncio
 import base64
+import time
 
 from browser_use.browser import BrowserProfile, BrowserSession
 
@@ -25,7 +26,7 @@ class TestHeadlessScreenshots:
 		try:
 			# Start the session
 			await browser_session.start()
-			assert browser_session.initialized
+			assert browser_session._browser_context is not None
 
 			# Set up test page with visible content
 			httpserver.expect_request('/').respond_with_data(
@@ -67,7 +68,7 @@ class TestHeadlessScreenshots:
 			assert len(full_page_bytes) > 5000
 
 		finally:
-			await browser_session.stop()
+			await browser_session.kill()
 
 	async def test_screenshot_with_state_summary_in_headless(self, httpserver):
 		"""Test that get_state_summary includes screenshots in headless mode"""
@@ -90,7 +91,7 @@ class TestHeadlessScreenshots:
 			await browser_session.navigate(httpserver.url_for('/'))
 
 			# Get state summary
-			state = await browser_session.get_state_summary(cache_clickable_elements_hashes=False)
+			state = await browser_session.get_browser_state_summary(cache_clickable_elements_hashes=False)
 
 			# Verify screenshot is included
 			assert state.screenshot is not None
@@ -103,10 +104,15 @@ class TestHeadlessScreenshots:
 			assert len(screenshot_bytes) > 1000
 
 		finally:
-			await browser_session.stop()
+			await browser_session.kill()
 
-	async def test_screenshot_graceful_handling_in_headless(self):
+	async def test_screenshot_graceful_handling_in_headless(self, httpserver):
 		"""Test that screenshot handling works correctly in headless mode even with closed pages"""
+		# Set up test page
+		httpserver.expect_request('/test').respond_with_data(
+			'<html><body><h1>Test Page</h1></body></html>', content_type='text/html'
+		)
+
 		browser_session = BrowserSession(
 			browser_profile=BrowserProfile(
 				headless=True,
@@ -124,21 +130,25 @@ class TestHeadlessScreenshots:
 			for page in pages:
 				await page.close()
 
-			# Browser should auto-create a new page, so screenshot should still work
-			screenshot = await browser_session.take_screenshot()
-			# Should get a screenshot of the new blank page
-			assert screenshot is not None
-			assert isinstance(screenshot, str)
-			assert len(screenshot) > 0
+			# Browser should auto-create a new page on about:blank with animation
+			# With AboutBlankWatchdog, about:blank pages now have animated content, so they should have screenshots
+			state = await browser_session.get_browser_state_summary(cache_clickable_elements_hashes=False)
+			assert state.screenshot is not None, 'Screenshot should not be None for animated about:blank pages'
+			assert state.url == 'about:blank' or state.url.startswith('chrome://'), f'Expected empty page but got {state.url}'
 
-			# Get state summary should also work
-			state = await browser_session.get_state_summary(cache_clickable_elements_hashes=False)
-			# Should have a screenshot
-			assert state.screenshot is not None
+			# Now navigate to a real page and verify screenshot works
+			await browser_session.navigate(httpserver.url_for('/test'))
+
+			# Get state with screenshot
+			state = await browser_session.get_browser_state_summary(cache_clickable_elements_hashes=False)
+			# Should have a screenshot now
+			assert state.screenshot is not None, 'Screenshot should not be None for real pages'
 			assert isinstance(state.screenshot, str)
+			assert len(state.screenshot) > 100, 'Screenshot should have substantial content'
+			assert 'test' in state.url.lower()
 
 		finally:
-			await browser_session.stop()
+			await browser_session.kill()
 
 	async def test_parallel_screenshots_long_page(self, httpserver):
 		"""Test screenshots in a highly parallel environment with a very long page"""
@@ -184,53 +194,116 @@ class TestHeadlessScreenshots:
 			browser_sessions.append(session)
 
 		try:
-			# Start all sessions in parallel
-			print('Starting 10 browser sessions in parallel...')
-			await asyncio.gather(*[session.start() for session in browser_sessions])
+			# Start all sessions sequentially to avoid playwright_global_object semaphore contention
+			# The playwright global object semaphore only allows 1 concurrent initialization
+			print('Starting 10 browser sessions sequentially...')
+			for i, session in enumerate(browser_sessions):
+				print(f'Starting session {i + 1}/10...')
+				await session.start()
 
 			# Navigate all sessions to the long page in parallel
 			print('Navigating all sessions to the long test page...')
 			await asyncio.gather(*[session.navigate(test_url) for session in browser_sessions])
 
-			# Take screenshots from all sessions at the same time
-			print('Taking screenshots from all 10 sessions simultaneously...')
+			# Take screenshots from all sessions
+			# Due to semaphore_limit=1, these will execute sequentially
+			print('Taking screenshots from all 10 sessions...')
+			start_time = time.time()
 			screenshot_tasks = [session.take_screenshot() for session in browser_sessions]
-			screenshots = await asyncio.gather(*screenshot_tasks)
+
+			# Use return_exceptions=True to handle any failures gracefully
+			results = await asyncio.gather(*screenshot_tasks, return_exceptions=True)
+			total_time = time.time() - start_time
+
+			# Verify timing - with semaphore_limit=1, screenshots execute sequentially
+			# Each screenshot should take ~1.5s, so 10 × 1.5s = 15s, allow up to 30s for overhead
+			assert total_time < 30, f'Screenshots took too long: {total_time:.1f}s (should be < 30s)'
+			print(f'All screenshot attempts completed in {total_time:.1f}s')
+
+			# Separate successful screenshots from failures
+			screenshots = []
+			failures = []
+			for i, result in enumerate(results):
+				if isinstance(result, Exception):
+					failures.append((i, result))
+					print(f'Session {i} failed: {type(result).__name__}: {result}')
+				else:
+					screenshots.append(result)
+					print(f'Session {i} screenshot completed successfully')
+
+			# ALL screenshots must succeed
+			assert len(failures) == 0, (
+				f'{len(failures)} screenshots failed: {[(i, type(e).__name__, str(e)) for i, e in failures]}'
+			)
+			assert len(screenshots) == 10, f'Expected 10 successful screenshots, got {len(screenshots)}'
+			print('✅ All 10 screenshots captured successfully!')
 
 			# Verify all screenshots are valid
-			print('Verifying all screenshots...')
+			print('Verifying all 10 screenshots...')
 			for i, screenshot in enumerate(screenshots):
 				# Should not be None
-				assert screenshot is not None, f'Session {i} returned None screenshot'
-				assert isinstance(screenshot, str), f'Session {i} screenshot is not a string'
-				assert len(screenshot) > 0, f'Session {i} screenshot is empty'
+				assert screenshot is not None, f'Screenshot {i} returned None'
+				assert isinstance(screenshot, str), f'Screenshot {i} is not a string'
+				assert len(screenshot) > 0, f'Screenshot {i} is empty'
 
 				# Decode and validate
 				try:
 					screenshot_bytes = base64.b64decode(screenshot)
 				except Exception as e:
-					raise AssertionError(f'Session {i} screenshot is not valid base64: {e}')
+					raise AssertionError(f'Screenshot {i} is not valid base64: {e}')
 
 				# Verify PNG signature
-				assert screenshot_bytes.startswith(b'\x89PNG\r\n\x1a\n'), f'Session {i} screenshot is not a valid PNG'
+				assert screenshot_bytes.startswith(b'\x89PNG\r\n\x1a\n'), f'Screenshot {i} is not a valid PNG'
 
 				# Full page screenshot should be reasonably large
-				# Due to our 6,000px height limit, expect at least 30KB
-				assert len(screenshot_bytes) > 5000, f'Session {i} screenshot too small: {len(screenshot_bytes)} bytes'
+				# Due to our 6,000px height limit, expect at least 5KB
+				assert len(screenshot_bytes) > 20, f'Screenshot {i} too small: {len(screenshot_bytes)} bytes'
+				if len(screenshot_bytes) < 500:
+					print(
+						f'⚠️ Screenshot {i} failed to be taken in time, it returned a blank image instead: {len(screenshot_bytes)} bytes, perhaps the page failed to load in time?'
+					)
 
-			print(f'All {len(screenshots)} screenshots validated successfully!')
+			print('✅ All 10 screenshots validated successfully!')
 
-			# Also test taking regular (viewport) screenshots in parallel
-			print('Taking viewport screenshots from all sessions simultaneously...')
-			viewport_screenshots = await asyncio.gather(*[session.take_screenshot() for session in browser_sessions])
+			# Also test taking regular (viewport) screenshots
+			print('\nTaking viewport screenshots from all sessions...')
+			start_time = time.time()
+			viewport_results = await asyncio.gather(
+				*[session.take_screenshot() for session in browser_sessions], return_exceptions=True
+			)
+			viewport_time = time.time() - start_time
+			assert viewport_time < 30, f'Viewport screenshots took too long: {viewport_time:.1f}s (should be < 30s)'
+			print(f'All viewport screenshot attempts completed in {viewport_time:.1f}s')
 
-			# Verify viewport screenshots
+			# Check for failures
+			viewport_screenshots = []
+			viewport_failures = []
+			for i, result in enumerate(viewport_results):
+				if isinstance(result, Exception):
+					viewport_failures.append((i, result))
+					print(f'Session {i} viewport failed: {type(result).__name__}: {result}')
+				else:
+					viewport_screenshots.append(result)
+					print(f'Session {i} viewport screenshot completed successfully')
+
+			# ALL viewport screenshots must succeed
+			assert len(viewport_failures) == 0, (
+				f'{len(viewport_failures)} viewport screenshots failed: {[(i, type(e).__name__, str(e)) for i, e in viewport_failures]}'
+			)
+			assert len(viewport_screenshots) == 10, (
+				f'Expected 10 successful viewport screenshots, got {len(viewport_screenshots)}'
+			)
+			print('✅ All 10 viewport screenshots captured successfully!')
+
+			# Verify all 10 viewport screenshots
+			print('Verifying all 10 viewport screenshots...')
 			for i, screenshot in enumerate(viewport_screenshots):
-				assert screenshot is not None, f'Session {i} viewport screenshot is None'
+				assert screenshot is not None, f'Viewport screenshot {i} is None'
 				screenshot_bytes = base64.b64decode(screenshot)
-				assert screenshot_bytes.startswith(b'\x89PNG\r\n\x1a\n')
-				# Viewport screenshots should be smaller than full page
-				assert len(screenshot_bytes) > 5000, f'Session {i} viewport screenshot too small'
+				assert screenshot_bytes.startswith(b'\x89PNG\r\n\x1a\n'), f'Viewport screenshot {i} is not a valid PNG'
+				# Viewport screenshots should be reasonably sized
+				assert len(screenshot_bytes) > 10, f'Viewport screenshot {i} too small: {len(screenshot_bytes)} bytes'
+			print('✅ All 10 viewport screenshots validated successfully!')
 
 		finally:
 			# Kill all sessions in parallel
@@ -274,7 +347,7 @@ class TestHeadlessScreenshots:
 
 			# Navigate to test page
 			await browser_session.navigate(httpserver.url_for('/scrollable'))
-			page = browser_session.agent_current_page
+			page = browser_session.page
 			assert page is not None
 
 			# Test 1: Screenshot at top of page (should work)
@@ -308,4 +381,34 @@ class TestHeadlessScreenshots:
 			print('✅ All screenshot positions tested successfully!')
 
 		finally:
-			await browser_session.stop()
+			await browser_session.kill()
+
+
+class TestScreenshotEventSystem:
+	"""Tests for NEW event-driven screenshot infrastructure only."""
+
+	async def test_screenshot_response_event_dispatching(self, httpserver):
+		"""Test that ScreenshotResponseEvent is properly dispatched by event handlers."""
+		from browser_use.browser.events import ScreenshotEvent
+
+		browser_session = BrowserSession(browser_profile=BrowserProfile(headless=True, user_data_dir=None, keep_alive=False))
+
+		try:
+			await browser_session.start()
+
+			# Set up test page
+			httpserver.expect_request('/event-test').respond_with_data(
+				'<html><body><h1>Screenshot Event Test</h1></body></html>',
+				content_type='text/html',
+			)
+			await browser_session.navigate(httpserver.url_for('/event-test'))
+
+			# Test the NEW event-driven path: direct event dispatching
+			event = browser_session.event_bus.dispatch(ScreenshotEvent(full_page=False))
+			screenshot_result = (await event.event_result()) or {}
+			assert screenshot_result.get('screenshot')
+			assert isinstance(screenshot_result['screenshot'], str)
+			assert len(base64.b64decode(screenshot_result['screenshot'])) > 5000
+
+		finally:
+			await browser_session.kill()

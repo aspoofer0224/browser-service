@@ -88,7 +88,7 @@ class TestAgentEventLifecycle:
 
 		assert isinstance(step_event, CreateAgentStepEvent)
 		assert step_event.agent_task_id == task_event.id
-		assert step_event.step == 2  # Step is incremented before event is emitted
+		assert step_event.step == 1  # Step is incremented before event is emitted
 		assert step_event.url == httpserver.url_for('/')
 
 		assert isinstance(update_event, UpdateAgentTaskEvent)
@@ -404,7 +404,7 @@ class TestEventValidation:
 				user_id='0683fb03-c5da-79c9-8000-d3a39c47c650',
 				agent_session_id='0683fb03-c5da-79c9-8000-d3a39c47c651',
 				task='test',
-				llm_model='gpt-4o',
+				llm_model='gpt-4.1',
 				done_output=None,
 				user_feedback_type=None,
 				user_comment=None,
